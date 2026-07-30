@@ -1,0 +1,128 @@
+# vllm-omni built against a real CUDA 12.8 toolkit.
+#
+# Why this file exists: the upstream docker/Dockerfile.cuda just layers vllm-omni
+# onto vllm/vllm-openai:v0.26.0, and that image family ships cu129 only -- there
+# is no cu128 tag anywhere in vllm/vllm-openai. To get a genuine 12.8 build we
+# compile vLLM v0.26.0 from source against nvidia/cuda:12.8.1-devel.
+#
+# vLLM v0.26.0 supports this: CMakeLists.txt has an explicit
+# `CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8` branch and falls back
+# to arch-specific (9.0a / 12.0a) targets on CUDA < 13.0.
+#
+# Build (from the vllm-omni repo root):
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cu128 -t vllm-omni:cu128 .
+
+ARG CUDA_TAG=12.8.1-devel-ubuntu24.04
+FROM nvidia/cuda:${CUDA_TAG}
+
+ARG VLLM_REF=v0.26.0
+# H200 is sm90a. Restricting the arch list is what keeps this build at ~40 min
+# instead of the multi-hour all-arch compile.
+ARG ARCH_LIST=9.0a
+ARG JOBS=48
+ARG NVCCTHREADS=2
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv \
+        git curl ca-certificates build-essential ccache pkg-config jq \
+        espeak-ng libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# vLLM 0.26 builds PyO3 extensions through setuptools-rust, so a Rust toolchain
+# is a hard build requirement (not optional).
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain stable
+
+# Ubuntu 24.04 marks the system interpreter externally-managed (PEP 668).
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH=/opt/venv/bin:/usr/local/cargo/bin:$PATH
+RUN python3.12 -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache-dir -U pip wheel uv
+
+# ---------------------------------------------------------------- torch cu128
+RUN uv pip install --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+
+# --------------------------------------------------- vLLM v0.26.0 from source
+RUN git clone --depth 1 --branch ${VLLM_REF} \
+        https://github.com/vllm-project/vllm.git /opt/vllm-src
+WORKDIR /opt/vllm-src
+
+# vLLM 0.26 pins CUDA-13 extras. humming-kernels publishes a cu12 variant, so
+# swap it. nvidia-cutlass-dsl is cu13-only -- install it bare so it does not drag
+# the CUDA 13 runtime in beside our cu128 torch (this only affects the optional
+# FA4 cute-DSL path, which we are not using on Hopper).
+RUN sed -i \
+        -e 's/^nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' \
+        -e 's/^humming-kernels\[cu13\]/humming-kernels[cu12]/' \
+        requirements/cuda.txt \
+    && grep -nE 'cutlass-dsl|humming|quack|flashinfer' requirements/cuda.txt
+
+RUN uv pip install -r requirements/build/cuda.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        --index-strategy unsafe-best-match
+
+# csrc/libtorch_stable/cooperative_topk.cuh calls libcu++ overloads that only
+# exist in CCCL >= 2.9 (shipped with CUDA 12.9):
+#   mbarrier_try_wait_parity(sem_relaxed, scope_cta, ...)
+#   mbarrier_arrive_expect_tx(sem_relaxed, scope_cta, space_shared, ...)
+#   cp_async_bulk(space_shared, space_global, ...)
+# CUDA 12.8 ships CCCL 2.8, whose signatures differ, so that one translation
+# unit cannot compile here. vLLM's CMake only gates it on CUDA >= 12.0, which is
+# too loose. The kernel is the DSA indexer (DeepSeek sparse attention) and every
+# use site is behind #ifdef VLLM_ENABLE_COOPERATIVE_TOPK, so dropping it is safe
+# for everything else -- including the Qwen3-backbone Higgs TTS models.
+# Kept version-conditional so a newer CUDA_TAG re-enables the kernel.
+RUN CUDA_VER="$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')" \
+    && echo "nvcc CUDA ${CUDA_VER}" \
+    && if [ "$(printf '12.9\n%s\n' "${CUDA_VER}" | sort -V | head -1)" != "12.9" ]; then \
+         echo "CUDA ${CUDA_VER} < 12.9 -> disabling cooperative_topk"; \
+         sed -i 's/^\( *\)if(COOPERATIVE_TOPK_ARCHS)/\1if(VLLM_COOP_TOPK_NEEDS_CUDA_12_9)/' \
+             CMakeLists.txt; \
+         grep -n 'VLLM_COOP_TOPK_NEEDS_CUDA_12_9' CMakeLists.txt; \
+       else \
+         echo "CUDA ${CUDA_VER} >= 12.9 -> keeping cooperative_topk"; \
+       fi
+
+ENV TORCH_CUDA_ARCH_LIST=${ARCH_LIST} \
+    MAX_JOBS=${JOBS} \
+    NVCC_THREADS=${NVCCTHREADS} \
+    VLLM_TARGET_DEVICE=cuda \
+    CMAKE_BUILD_TYPE=Release \
+    CCACHE_DIR=/root/.cache/ccache
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    pip install --no-build-isolation --no-cache-dir -v .
+
+# ------------------------------------------------------------------ vllm-omni
+COPY . /opt/vllm-omni
+WORKDIR /opt/vllm-omni
+RUN uv pip install --no-build-isolation -e . \
+    && uv pip install --no-build-isolation -r requirements/cuda.txt
+
+# vLLM pins torchcodec>=0.14, but download.pytorch.org only ships cu128 builds up
+# to 0.9.1 -- so pip resolves the generic PyPI wheel, which links libnvrtc.so.13
+# (CUDA 13) and cannot dlopen inside a CUDA 12.8 image. transformers imports
+# torchcodec eagerly when constructing an audio pipeline, so this breaks every
+# audio model, not only direct torchcodec users. The +cpu build of the same
+# version satisfies the pin and decodes on CPU with no CUDA runtime at all,
+# which is what these audio paths actually need.
+RUN uv pip install --no-deps --index-url https://download.pytorch.org/whl/cpu \
+        "torchcodec==0.15.0+cpu"
+
+# Fail the build loudly if anything above quietly replaced our cu128 torch, or
+# if the audio decode path is broken again.
+RUN python -c "\
+import torch, vllm, vllm_omni, torchcodec, torchcodec.decoders;\
+cu = torch.version.cuda;\
+print('torch', torch.__version__, 'cuda', cu);\
+print('vllm', vllm.__version__);\
+print('torchcodec', torchcodec.__version__);\
+assert cu.startswith('12.8'), 'expected a CUDA 12.8 torch build, got ' + str(cu)"
+
+ENV PATH=/opt/venv/bin:$PATH
+ENTRYPOINT []
